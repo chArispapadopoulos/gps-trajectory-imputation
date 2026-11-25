@@ -1,66 +1,108 @@
-# GPS Trajectory Imputation with a Masked Transformer
+# Imputation of Incomplete GPS Trajectories with Deep Learning Models Trained via Masking
 
-Diploma thesis, School of Electrical and Computer Engineering, Aristotle University of Thessaloniki (2026).
-Supervisor: Prof. Anastasios Delopoulos.
+Diploma thesis, School of Electrical and Computer Engineering, Aristotle University of Thessaloniki.
+Author: Charalampos-Panagiotis Papadopoulos · Supervisor: Prof. Anastasios Delopoulos
 
-GPS traces are often interrupted for minutes or hours, because the sensor is switched off or loses signal. This thesis fills such gaps with a Transformer encoder trained with masking, and compares it with the statistical method of Barnett \& Onnela (2020) on exactly the same gaps.
+GPS recordings from phones and wearables often stop for minutes or hours, because of signal loss or because the sensor is switched off to save battery. This project fills in those gaps. It compares two approaches:
 
-The full thesis is in [`thesis.pdf`](thesis.pdf) (in Greek) and the defence slides in `Thesis presentation.pptx`. The markdown cells of the notebooks are also in Greek.
+- a **Transformer encoder** trained with masking (in the spirit of BERT) that regresses the missing coordinates directly, and
+- a **modified version of the statistical method of Barnett & Onnela (2020)**, used as the baseline.
 
-## Overview
+Both methods learn only from the history of a single user. No road network is needed at inference time.
 
-**Data.** GPS traces of a single user in Thessaloniki, 170 days in total, exported as recording sessions and turned into one table of points with time offsets `dt` and displacements `dx, dy`. Coordinates are projected to EGSA'87 (EPSG:2100), so distances are in metres.
+## Method in short
+
+**Data.** 170 days (May–December 2025) of GPS data from one user, sampled about once per minute. After preprocessing, 192,195 points remain. Each point gets a state flag (pause, flight, gap, break). The recording is then split into continuous segments, and stops and trips are detected.
+
+**Input.** Windows of 48 points (about 48 minutes) with 13 features per point: position relative to home, displacement, time of day and day of week as sin/cos, time step, segment start/end, `is_masked` and `gap_frac`.
 
 **Model.**
+- Conv1d embedding (kernel 3) plus learned positional embedding.
+- 3 Pre-LN Transformer encoder layers, d = 128, 4 heads, about 623k parameters.
+- Regression head that outputs continuous coordinates.
+- 3 rounds of iterative refinement: each round's prediction is fed back as input.
 
-* Window of 48 points. A gap of 2–31 points is hidden inside it. Hidden positions are set to a sentinel value and the model predicts their coordinates (regression, no classifier head).
-* Conv1d input layer, learned positional embeddings and a 3-layer pre-LN Transformer encoder (`d\_model` 128, 4 heads, dropout 0.3).
-* 13 input features per point: position relative to home, displacement, time of day and day of week (sin/cos), time step, segment boundaries, mask flag and relative position inside the gap.
-* 0–3 visible waypoints can be placed inside a gap to disambiguate which route was taken.
-* 3 refinement rounds: the predictions of one round are fed back as input to the next.
-* Loss: error on the hidden points (MIT) plus a weighted error on the visible ones (ORT).
-* Training uses a curriculum on the gap length (3 → 31) and a sampler that favours windows on trips and in movement.
+**Masking.**
+- A contiguous span of L = 2…31 points is hidden, with p(L) ∝ 1/√L.
+- A curriculum raises the maximum L from 3 to 31.
+- Windows with movement are oversampled.
+- A few **waypoints** inside the gap stay visible, chosen with trajectory simplification criteria (PED/SED). They help the model pick the right road instead of averaging between alternatives.
 
-**Baseline.** Own implementation of the Barnett \& Onnela flight/pause simulation (kernel with a Student-t weight, mean of 100 simulations) with a modified bridging step.
+**Loss.**
+- MIT: error on the hidden points.
+- ORT: reconstruction of the visible points, as in SAITS.
+- Optional step-length term.
+- The rounds are weighted 0.3 / 0.3 / 1.
+
+**Baseline.** Barnett & Onnela flight/pause sampling from the user's history with two changes:
+1. a Student-t kernel (ν = 30) instead of Cauchy, so events near home no longer dominate;
+2. a recursive bridging correction that keeps the shape of the simulated path.
 
 **Evaluation.**
+- 4-fold cross-validation over consecutive time periods, with a validation week inside each development set.
+- Test gaps of L = 3, 6, 11, 20, 31 points in each window.
+- Gaps are split into those with movement (≥ 500 m) and those without.
+- Results are also broken down by *familiarity*: on how many days the user has passed through the area of the gap.
+- 95% confidence intervals come from bootstrapping whole gaps.
 
-* 4-fold cross-validation over consecutive days. The validation set is the last full week of each non-test fold.
-* Gap lengths 3, 6, 11, 20 and 31 points, evaluated with and without waypoints and separately for gaps with and without movement.
-* Metrics: RMSE with a bootstrap 95% confidence interval, median and p90 error, path error and familiarity of the area.
-* Twelve model variants compared (loss terms, route augmentation with OSM map matching, learning rate, model size, dropout). The main variant is "Π9".
+## Main results
 
-Results are in Chapter 4 of the thesis. `analysis\_all\_folds.ipynb` reproduces its Tables 4.1–4.12 and the training-curve figure.
+Main variant V9 (ORT, learning rate 10⁻³), on the 2,519 test gaps with movement, with waypoints:
 
-## Files
+| Metric | Barnett & Onnela (modified) | Transformer (V9) |
+| --- | --- | --- |
+| Median position error | 172 m | **105 m** |
+| RMSE, all gaps | **468 m** | 617 m |
+| RMSE, familiarity ≥ 10 days | 395 m | **297 m** |
+| RMSE, unfamiliar gaps (76) | **1,138 m** | 3,032 m |
+| Gaps where the model is better | | **68%** |
+
+- The model usually finds the right path: the median distance from the true path is 27 m. Most of the remaining error is in *timing* along the path.
+- Without waypoints the error roughly doubles.
+- Familiarity drives the error. The baseline is safer in areas the user rarely visits, which is why its overall RMSE is lower. Without the two hardest days, the model's RMSE is 353 m vs 467 m for the baseline.
+
+## Repository structure
 
 ```
-preprocessing.ipynb        raw export -> cleaned dataset (final\_dataset\_thess9.csv)
-train\_eval\_fold.ipynb      segments, trips, windows, masking, training and evaluation of one CV fold
-barnett\_onnela.ipynb       Barnett \& Onnela baseline on the same gaps
-analysis\_all\_folds.ipynb   tables and figures over the 4 folds
-thesis.pdf                 full thesis (Greek)
-Thesis presentation.pptx   defence slides
+thesis_EN.pdf                 full thesis in English
+thesis.pdf                    full thesis in Greek (original)
+Thesis_Presentation_EN.pptx   defense slides in English
+Thesis presentation.pptx      defense slides in Greek (original)
+preprocessing.ipynb           raw export -> cleaned dataset (final_dataset_thess9.csv)
+train_eval_fold.ipynb         segments, features, windows, masking, training and test predictions for one fold
+barnett_onnela.ipynb          modified Barnett & Onnela baseline on the same test gaps
+analysis_all_folds.ipynb      tables and figures of the thesis from the outputs of all folds
 ```
 
 ## How to run
 
-The data and the run outputs are not in this repository, so the notebooks show the pipeline rather than run out of the box.
-
-1. `preprocessing.ipynb`: set `HOME\_LAT` and `HOME\_LON` to your own home location. Input is `export\_gps\_v1.csv` (sessions with latitude, longitude and elapsed time). Output is `final\_dataset\_thess9.csv`.
-2. `train\_eval\_fold.ipynb`: run once per fold with `FOLD` set to 1–4, each in its own folder with the dataset. A GPU is recommended. The training runs were done without a fixed seed, so a new run gives slightly different numbers.
-3. `barnett\_onnela.ipynb`: reads the gaps from the prediction files of step 2, so the two methods are compared on identical gaps.
-4. `analysis\_all\_folds.ipynb`: aggregates the outputs of steps 2 and 3. The expected folder layout is set at the top of the notebook (`ROOT`, `RUNS`, `BARNETT`).
-
-## Requirements
-
-Python with `numpy`, `pandas`, `scipy`, `pyproj`, `matplotlib` and `torch`. Only the optional route augmentation needs `osmnx`, `networkx` and `shapely`. Training ran on Google Colab and on the AUTH Aristotelis HPC cluster (SLURM, one GPU per fold).
+1. Install the dependencies:
+   ```
+   pip install numpy pandas scipy matplotlib torch pyproj shapely osmnx networkx
+   ```
+   `osmnx` is needed only for the optional route augmentation.
+2. Run `preprocessing.ipynb` on your own GPS export to produce `final_dataset_thess9.csv`. Set `HOME_LAT` / `HOME_LON` to your own home location.
+3. Run `train_eval_fold.ipynb` once per fold. Set `FOLD = 1…4` and use a separate folder per run. A GPU is recommended.
+4. Run `barnett_onnela.ipynb`. It reads the test gaps saved by the model runs (`pred_fold{F}_*.csv`).
+5. Run `analysis_all_folds.ipynb` to build the result tables and figures. The `RUNS` dictionary at the top maps each variant of the thesis to the output folder of its training runs; edit the paths to match yours.
 
 ## Data
 
-The GPS dataset is personal data and is not included in this repository.
+The GPS data are **not included**, because they reveal the home location and daily routine of a real person. To reproduce the pipeline, use your own data with columns for timestamp, latitude and longitude. See the first cells of `preprocessing.ipynb` for the expected input format.
 
-## Reference
+## References
 
-Barnett, I., \& Onnela, J.-P. (2020). Inferring mobility measures from GPS traces with missing data. *Biostatistics*, 21(2), e98–e112.
+- I. Barnett and J.-P. Onnela, "Inferring mobility measures from GPS traces with missing data," *Biostatistics*, 21(2):e98–e112, 2020.
+- N. M. Gardazi et al., "BERT applications in natural language processing: a review," *Artificial Intelligence Review*, 58:166, 2025.
 
+## Citation
+
+```
+@mastersthesis{papadopoulos_gps_imputation,
+  author = {Charalampos-Panagiotis Papadopoulos},
+  title  = {Imputation of Incomplete GPS Trajectories with Deep Learning Models Trained via Masking},
+  school = {Aristotle University of Thessaloniki, School of Electrical and Computer Engineering},
+  year   = {2026},
+  note   = {Diploma thesis. Supervisor: Anastasios Delopoulos}
+}
+```
